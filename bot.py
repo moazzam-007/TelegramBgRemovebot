@@ -1,124 +1,122 @@
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 from fastapi import FastAPI, Request
-from PIL import Image, ImageEnhance
-from rembg import remove
-from dotenv import load_dotenv
 import os
-import io
+from rembg import remove
+from PIL import Image, ImageEnhance
+from dotenv import load_dotenv
 import asyncio
+from io import BytesIO
 
-# Load .env variables
+# Load environment variables
 load_dotenv()
+
 TOKEN = os.getenv("TOKEN")
-
 if not TOKEN:
-    raise ValueError("TOKEN not found in .env file!")
+    raise ValueError("Bot token not found in environment!")
 
-# --- FASTAPI ---
-app_fastapi = FastAPI()
+# ========== FastAPI App ==========
+app = FastAPI()
 
-@app_fastapi.get("/")
-def root():
-    return {"status": "Bot is running fine ✅"}
+@app.get("/")
+async def home():
+    return {"message": "Bot is running!"}
 
-@app_fastapi.post("/webhook")
-async def telegram_webhook(update: dict):
-    await application.update_queue.put(Update.de_json(update, application.bot))
-    return {"ok": True}
+@app.post("/")
+async def handle(request: Request):
+    return await application.update_queue.put(await request.json())
 
-# --- TELEGRAM BOT LOGIC ---
+# ========== Bot Setup ==========
 application = ApplicationBuilder().token(TOKEN).build()
 
-# Templates
-TEMPLATES = {
-    "1": "templates/1.png",
-    "2": "templates/2.png",
-    "3": "templates/3.png",
-}
+# In-memory storage for user choices
+user_preferences = {}
 
-# Button Interface
-def get_template_buttons():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Template 1", callback_data="1"),
-        InlineKeyboardButton("Template 2", callback_data="2"),
-        InlineKeyboardButton("Template 3", callback_data="3"),
-    ]])
+# ========== Helper Functions ==========
+def process_image(image_data, method, template_path):
+    image = Image.open(BytesIO(image_data)).convert("RGBA")
+    no_bg = remove(image)
 
-# Store user preferences
-user_data = {}
+    # Resize logic
+    template = Image.open(template_path).convert("RGBA")
+    temp_w, temp_h = template.size
+    img_w, img_h = no_bg.size
 
+    if method == "scale_height":
+        new_h = int(temp_h * 0.9)
+        scale = new_h / img_h
+        new_w = int(img_w * scale)
+    else:  # scale_width
+        new_w = int(temp_w * 0.9)
+        scale = new_w / img_w
+        new_h = int(img_h * scale)
+
+    resized = no_bg.resize((new_w, new_h))
+    offset = ((temp_w - new_w) // 2, (temp_h - new_h) // 2)
+    template.paste(resized, offset, resized)
+
+    result = BytesIO()
+    result.name = "final.png"
+    template.save(result, "PNG")
+    result.seek(0)
+    return result
+
+# ========== Bot Handlers ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_data[user_id] = {"template": "1", "mode": "width"}
-    await update.message.reply_text(
-        "👋 Send me an image and I'll remove background and paste it on your template.\n\n"
-        "Choose a template:", reply_markup=get_template_buttons()
-    )
+    keyboard = [
+        [InlineKeyboardButton("Template 1", callback_data="template_1"),
+         InlineKeyboardButton("Template 2", callback_data="template_2")],
+        [InlineKeyboardButton("Scale by Height", callback_data="scale_height"),
+         InlineKeyboardButton("Scale by Width", callback_data="scale_width")]
+    ]
+    user_preferences[update.effective_user.id] = {"template": "template_1", "scale": "scale_height"}
+    await update.message.reply_text("Send me an image.", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    template_id = query.data
-    user_id = query.from_user.id
-    user_data.setdefault(user_id, {})
-    user_data[user_id]["template"] = template_id
-    await query.edit_message_text(f"✅ Template {template_id} selected.\nNow send an image.")
-
-async def process_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_prefs = user_data.get(user_id, {"template": "1", "mode": "width"})
-    template_path = TEMPLATES.get(user_prefs["template"], "templates/1.png")
-    resize_mode = user_prefs.get("mode", "width")
-
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
-    photo_bytes = await file.download_as_bytearray()
-    
-    try:
-        # Process image
-        input_image = Image.open(io.BytesIO(photo_bytes)).convert("RGBA")
-        no_bg = remove(input_image)
+    image_data = await file.download_as_bytearray()
 
-        template = Image.open(template_path).convert("RGBA")
-        template_width, template_height = template.size
+    user_id = update.effective_user.id
+    prefs = user_preferences.get(user_id, {"template": "template_1", "scale": "scale_height"})
 
-        # Resize
-        if resize_mode == "width":
-            base_width = int(template_width * 0.8)
-            w_percent = base_width / float(no_bg.width)
-            h_size = int((float(no_bg.height) * w_percent))
-            no_bg = no_bg.resize((base_width, h_size), Image.Resampling.LANCZOS)
-        else:  # height
-            base_height = int(template_height * 0.8)
-            h_percent = base_height / float(no_bg.height)
-            w_size = int((float(no_bg.width) * h_percent))
-            no_bg = no_bg.resize((w_size, base_height), Image.Resampling.LANCZOS)
+    template_file = "template1.png" if prefs["template"] == "template_1" else "template2.png"
+    result = process_image(image_data, prefs["scale"], template_file)
 
-        # Center paste
-        paste_x = (template_width - no_bg.width) // 2
-        paste_y = (template_height - no_bg.height) // 2
-        template.paste(no_bg, (paste_x, paste_y), no_bg)
+    await update.message.reply_photo(result, caption="Here is your final image.")
 
-        # Save and send
-        output_buffer = io.BytesIO()
-        template.save(output_buffer, format='PNG')
-        output_buffer.seek(0)
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    prefs = user_preferences.setdefault(user_id, {})
 
-        await update.message.reply_photo(photo=output_buffer)
+    if query.data.startswith("template_"):
+        prefs["template"] = query.data
+        await query.answer("Template selected.")
+    elif query.data.startswith("scale_"):
+        prefs["scale"] = query.data
+        await query.answer("Scaling method selected.")
 
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+    await query.edit_message_text("Send your image now or select more options.", reply_markup=query.message.reply_markup)
 
-# --- HANDLERS ---
+# ========== Register Handlers ==========
 application.add_handler(CommandHandler("start", start))
-application.add_handler(CallbackQueryHandler(handle_button))
-application.add_handler(MessageHandler(filters.PHOTO, process_image))
+application.add_handler(MessageHandler(filters.PHOTO, handle_image))
+application.add_handler(CallbackQueryHandler(button))
 
-# --- RUN WITH Uvicorn in Render ---
+# ========== Run Server ==========
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("bot:app_fastapi", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    port = int(os.environ.get("PORT", 8000))  # Use Render-provided port
+    uvicorn.run("bot:app", host="0.0.0.0", port=port)
